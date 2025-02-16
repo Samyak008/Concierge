@@ -1,100 +1,109 @@
-from fastapi import FastAPI, HTTPException
-from typing import List, Optional, Dict, Any
 from datetime import datetime
+from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
-from config import supabase
+from config import groq_api_key
+from groq_client import GroqClient
+from supabase_client import fetch_table_data, update_table_data, insert_table_data
 
-# Update FastAPI app with metadata
-app = FastAPI(
-    title="Room Service Agent API",
-    description="API for hotel room service management",
-    version="1.0.0",
-    docs_url="/",  # This will show Swagger UI at root URL
-)
+# Define data models for validation
+class RoomServiceOrder(BaseModel):
+    order_id: int = Field(description="Unique identifier for the room service order")
+    booking_id: int = Field(description="Associated booking ID")
+    room_id: int = Field(description="Room number for delivery")
+    order_time: datetime = Field(description="Time when order was placed")
+    delivery_time: Optional[datetime] = Field(description="Time when order was delivered")
+    status: str = Field(description="Current status of the order")
+    special_instructions: Optional[str] = Field(description="Any special instructions for the order")
+    total_amount: float = Field(description="Total cost of the order")
 
-# Add basic health check endpoint
-@app.get("/health")
-async def health_check():
-    """Check if the service is running"""
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+class HousekeepingSchedule(BaseModel):
+    schedule_id: int = Field(description="Unique identifier for housekeeping schedule")
+    room_id: int = Field(description="Room to be cleaned")
+    scheduled_date: datetime = Field(description="Date scheduled for cleaning")
+    status: str = Field(description="Current status of housekeeping")
+    staff_assigned: Optional[str] = Field(description="Staff member assigned to the task")
+    notes: Optional[str] = Field(description="Additional notes about housekeeping")
+    completed_at: Optional[datetime] = Field(description="Time when cleaning was completed")
 
-# Pydantic models
-class MenuItem(BaseModel):
-    item_id: int
-    name: str
-    description: Optional[str]
-    price: float    
-    category: str
-    availability: bool = True
-    preparation_time: Optional[int] = None
-    image_url: Optional[str] = None
+async def get_room_service_orders(status: Optional[str] = None, room_id: Optional[int] = None) -> List[RoomServiceOrder]:
+    """Fetch room service orders with optional filtering"""
+    orders = fetch_table_data('room_service_orders')
+    if status:
+        orders = [order for order in orders if order['status'] == status]
+    if room_id:
+        orders = [order for order in orders if order['room_id'] == room_id]
+    return [RoomServiceOrder(**order) for order in orders]
 
-class OrderItem(BaseModel):
-    item_id: int
-    quantity: int
-    notes: Optional[str] = None
+async def update_order_status(order_id: int, new_status: str) -> RoomServiceOrder:
+    """Update the status of a room service order"""
+    valid_statuses = ['pending', 'preparing', 'delivered', 'cancelled']
+    if new_status not in valid_statuses:
+        raise ValueError(f"Invalid status. Must be one of {valid_statuses}")
+    data = {
+        'status': new_status,
+        'delivery_time': datetime.now().isoformat() if new_status == 'delivered' else None
+    }
+    updated_order = update_table_data('room_service_orders', order_id, data)
+    return RoomServiceOrder(**updated_order[0])
 
-class OrderCreate(BaseModel):
-    booking_id: int
-    room_id: int
-    special_instructions: Optional[str] = None
-    items: List[OrderItem]
+async def get_housekeeping_schedule(date: Optional[datetime] = None, status: Optional[str] = None) -> List[HousekeepingSchedule]:
+    """Fetch housekeeping schedule with optional filtering"""
+    schedules = fetch_table_data('housekeeping_schedule')
+    if date:
+        schedules = [schedule for schedule in schedules if schedule['scheduled_date'] == date.isoformat()]
+    if status:
+        schedules = [schedule for schedule in schedules if schedule['status'] == status]
+    return [HousekeepingSchedule(**schedule) for schedule in schedules]
 
-# Basic API endpoints
-@app.get("/menu", response_model=List[MenuItem])
-async def get_menu(category: Optional[str] = None):
-    """Get available menu items, optionally filtered by category"""
-    query = supabase.table("menu_items").select("*").eq("availability", True)
-    
-    if category:
-        query = query.eq("category", category)
-    
-    response = query.execute()
-    return response.data if response.data else []
+async def update_housekeeping_status(schedule_id: int, new_status: str, notes: Optional[str] = None) -> HousekeepingSchedule:
+    """Update the status of a housekeeping schedule"""
+    valid_statuses = ['scheduled', 'in_progress', 'completed', 'skipped']
+    if new_status not in valid_statuses:
+        raise ValueError(f"Invalid status. Must be one of {valid_statuses}")
+    data = {
+        'status': new_status,
+        'completed_at': datetime.now().isoformat() if new_status == 'completed' else None
+    }
+    if notes:
+        data['notes'] = notes
+    updated_schedule = update_table_data('housekeeping_schedule', schedule_id, data)
+    return HousekeepingSchedule(**updated_schedule[0])
 
-@app.post("/orders")
-async def create_order(order: OrderCreate):
-    """Create a new room service order"""
-    # Validate booking exists and is active
-    booking = supabase.table("bookings").select("status").eq("booking_id", order.booking_id).execute()
-    
-    if not booking.data or booking.data[0]["status"] not in ["confirmed", "checked_in"]:
-        raise HTTPException(status_code=400, detail="Invalid or inactive booking")
-
-    # Calculate total amount
-    total = 0
-    items_data = []
-    
-    for item in order.items:
-        menu_item = supabase.table("menu_items").select("price").eq("item_id", item.item_id).execute()
-        if not menu_item.data:
-            raise HTTPException(status_code=404, detail=f"Menu item {item.item_id} not found")
-            
-        price = menu_item.data[0]["price"]
-        total += price * item.quantity
-        items_data.append({
-            "item_id": item.item_id,
-            "quantity": item.quantity,
-            "price": price,
-            "notes": item.notes
-        })
-
-    # Create order
-    order_data = {
-        "booking_id": order.booking_id,
-        "room_id": order.room_id,
-        "special_instructions": order.special_instructions,
-        "total_amount": total,
-        "status": "pending"
+async def get_room_status_summary() -> Dict:
+    """Get a summary of room statuses including pending orders and scheduled cleaning"""
+    active_orders = await get_room_service_orders(status='pending')
+    today_cleaning = await get_housekeeping_schedule(date=datetime.now())
+    return {
+        'pending_orders': len(active_orders),
+        'scheduled_cleaning': len(today_cleaning),
+        'rooms_with_orders': list(set(order.room_id for order in active_orders)),
+        'rooms_to_clean': list(set(schedule.room_id for schedule in today_cleaning)),
+        'timestamp': datetime.now().isoformat()
     }
 
-    order_response = supabase.table("room_service_orders").insert(order_data).execute()
-    
-    if not order_response.data:
-        raise HTTPException(status_code=500, detail="Failed to create order")
+# Example usage
+async def main():
+    try:
+        # Fetch and print data from room_service_orders table
+        room_service_orders = fetch_table_data('room_service_orders')
+        print("Room Service Orders:")
+        print(room_service_orders)
         
-    return {"order_id": order_response.data[0]["order_id"], "status": "pending"}
+        # Fetch and print data from housekeeping_schedule table
+        housekeeping_schedule = fetch_table_data('housekeeping_schedule')
+        print("Housekeeping Schedule:")
+        print(housekeeping_schedule)
+        
+        # Get all pending orders
+        result = await get_room_service_orders(status="pending")
+        print([order.dict() for order in result])
+        
+        # Get today's housekeeping schedule
+        result = await get_housekeeping_schedule(date=datetime.now())
+        print([schedule.dict() for schedule in result])
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import asyncio
+    asyncio.run(main())
